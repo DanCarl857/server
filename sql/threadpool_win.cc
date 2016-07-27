@@ -384,7 +384,16 @@ static inline void tp_callback(PTP_CALLBACK_INSTANCE instance, PVOID context)
 static VOID CALLBACK io_completion_callback(PTP_CALLBACK_INSTANCE instance, 
   PVOID context,  PVOID overlapped,  ULONG io_result, ULONG_PTR nbytes, PTP_IO io)
 {
-  tp_callback(instance, context);
+  TP_connection_win *c= (TP_connection_win *)context;
+  /*
+    Execute high priority connections immediately.
+    'Yield' in case of low priority connections, i.e SubmitThreadpoolWork (with the same callback)
+    which makes Windows threadpool place the items at the end of its internal work queue.
+  */
+  if (c->priority == TP_PRIORITY_HIGH)
+    tp_callback(instance, context);
+  else
+    SubmitThreadpoolWork(c->work);
 }
 
 

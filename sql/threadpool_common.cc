@@ -115,6 +115,38 @@ static void thread_attach(THD* thd)
 #endif
 }
 
+/*
+  Determine connection priority , using current 
+  transaction state and 'threadpool_high_prio_mode' variable value.
+*/
+static TP_PRIORITY get_priority(TP_connection *c)
+{
+  switch (c->thd->variables.threadpool_high_prio_mode)
+  {
+  case TP_HIGH_PRIO_MODE_NONE:
+    return TP_PRIORITY_HIGH;
+  case TP_HIGH_PRIO_MODE_STATEMENTS:
+    return TP_PRIORITY_LOW;
+  case TP_HIGH_PRIO_MODE_TRANSACTIONS:
+    if (c->thd->transaction.is_active())
+    {
+      if (c->used_high_prio_tickets < c->thd->variables.threadpool_high_prio_tickets)
+      {
+        c->used_high_prio_tickets++;
+        return TP_PRIORITY_HIGH;
+      }
+      else
+      {
+        c->used_high_prio_tickets=0;
+        return TP_PRIORITY_LOW;
+      }
+    }
+    return TP_PRIORITY_LOW;
+  }
+  DBUG_ASSERT(0);
+  return TP_PRIORITY_LOW;
+}
+
 
 void tp_callback(TP_connection *c)
 {
@@ -141,6 +173,9 @@ void tp_callback(TP_connection *c)
     /* QUIT or an error occured. */
     goto error;
   }
+
+  /* Set priority */
+  c->priority= get_priority(c);
 
   /* Read next command from client. */
   c->set_io_timeout(thd->variables.net_wait_timeout);

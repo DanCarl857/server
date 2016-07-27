@@ -63,11 +63,13 @@ extern void tp_scheduler(void);
 extern int show_threadpool_idle_threads(THD *thd, SHOW_VAR *var, char *buff,
                                         enum enum_var_type scope);
 
+#define TP_HIGH_PRIO_MODE_TRANSACTIONS 0
+#define TP_HIGH_PRIO_MODE_STATEMENTS   1
+#define TP_HIGH_PRIO_MODE_NONE         2
 
 enum  TP_PRIORITY {
   TP_PRIORITY_HIGH,
-  TP_PRIORITY_LOW,
-  TP_PRIORITY_NONE
+  TP_PRIORITY_LOW
 };
 
 
@@ -91,12 +93,13 @@ struct TP_connection
   CONNECT*    connect;
   TP_STATE    state;
   TP_PRIORITY priority;
-
+  uint        used_high_prio_tickets;
   TP_connection(CONNECT *c) :
     thd(0),
     connect(c),
     state(TP_STATE_IDLE),
-    priority(TP_PRIORITY_NONE)
+    priority(TP_PRIORITY_HIGH),
+    used_high_prio_tickets(0)
   {}
 
   virtual ~TP_connection()

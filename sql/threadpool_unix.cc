@@ -148,7 +148,7 @@ struct TP_connection_unix:public TP_connection
   TP_connection_unix **prev_in_queue;
   ulonglong abs_wait_timeout;
   bool bound_to_poll_descriptor;
-  bool waiting;
+  int waiting;
 #ifdef HAVE_IOCP
   OVERLAPPED overlapped;
 #endif
@@ -164,10 +164,12 @@ typedef I_P_List<TP_connection_unix,
                      I_P_List_fast_push_back<TP_connection_unix> >
 connection_queue_t;
 
+const int NQUEUES=2; /* We have high and low priority queues*/
+
 struct thread_group_t 
 {
   mysql_mutex_t mutex;
-  connection_queue_t queue;
+  connection_queue_t queues[NQUEUES];
   worker_list_t waiting_threads; 
   worker_thread_t *listener;
   pthread_attr_t *pthread_attr;
@@ -511,14 +513,43 @@ static TP_connection_unix *queue_get(thread_group_t *thread_group)
 {
   DBUG_ENTER("queue_get");
   thread_group->queue_event_count++;
-  TP_connection_unix *c= thread_group->queue.front();
-  if (c)
+  for (int i=0; i < NQUEUES; i++)
   {
-    thread_group->queue.remove(c);
+    connection_queue_t *q= &(thread_group->queues[i]);
+    TP_connection_unix *c= q->front();
+    if (c)
+    {
+      q->remove(c);
+      DBUG_RETURN(c);
+    }
   }
-  DBUG_RETURN(c);  
+  DBUG_RETURN(0);  
 }
 
+static bool is_queue_empty(thread_group_t *thread_group)
+{
+  for (int i=0; i < NQUEUES; i++)
+  {
+    if (!thread_group->queues[i].is_empty())
+      return false;
+  }
+  return true;
+}
+
+
+static void queue_init(thread_group_t *thread_group)
+{
+  for (int i=0; i < NQUEUES; i++)
+  {
+    thread_group->queues[i].empty();
+  }
+}
+
+
+static void queue_push_back(thread_group_t *thread_group, TP_connection_unix *c)
+{
+  thread_group->queues[c->priority].push_back(c);
+}
 
 /* 
   Handle wait timeout : 
@@ -681,7 +712,7 @@ void check_stall(thread_group_t *thread_group)
     do wait and indicate that via thd_wait_begin/end callbacks, thread creation
     will be faster.
   */
-  if (!thread_group->queue.is_empty() && !thread_group->queue_event_count)
+  if (!is_queue_empty(thread_group) && !thread_group->queue_event_count)
   {
     thread_group->stalled= true;
     wake_or_create_thread(thread_group);
@@ -800,7 +831,7 @@ static TP_connection_unix * listener(worker_thread_t *current_thread,
      more workers.
     */
     
-    bool listener_picks_event= thread_group->queue.is_empty();
+    bool listener_picks_event=is_queue_empty(thread_group);
     
     /* 
       If listener_picks_event is set, listener thread will handle first event, 
@@ -810,7 +841,7 @@ static TP_connection_unix * listener(worker_thread_t *current_thread,
     for(int i=(listener_picks_event)?1:0; i < cnt ; i++)
     {
       TP_connection_unix *c= (TP_connection_unix *)native_event_get_userdata(&ev[i]);
-      thread_group->queue.push_back(c);
+      queue_push_back(thread_group,c);
     }
     
     if (listener_picks_event)
@@ -1002,7 +1033,7 @@ int thread_group_init(thread_group_t *thread_group, pthread_attr_t* thread_attr)
   thread_group->pollfd= -1;
   thread_group->shutdown_pipe[0]= -1;
   thread_group->shutdown_pipe[1]= -1;
-  thread_group->queue.empty();
+  queue_init(thread_group);
   DBUG_RETURN(0);
 }
 
@@ -1123,8 +1154,8 @@ static void queue_put(thread_group_t *thread_group, TP_connection_unix *connecti
   DBUG_ENTER("queue_put");
 
   mysql_mutex_lock(&thread_group->mutex);
-  thread_group->queue.push_back(connection);
 
+  queue_push_back(thread_group,connection);
   if (thread_group->active_thread_count == 0)
     wake_or_create_thread(thread_group);
 
@@ -1203,21 +1234,28 @@ TP_connection_unix *get_event(worker_thread_t *current_thread,
       thread_group->listener= NULL;
       break;
     }
-    
+ 
+
     /* 
       Last thing we try before going to sleep is to 
-      pick a single event via epoll, without waiting (timeout 0)
+      non-blocking event poll, i.e with timeout = 0.
+      If this returns events, pick one
     */
     if (!oversubscribed)
     {
-      native_event nev;
-      if (io_poll_wait(thread_group->pollfd,&nev,1, 0) == 1)
+
+      native_event ev[MAX_EVENTS];
+      int cnt = io_poll_wait(thread_group->pollfd, ev, MAX_EVENTS, 0);
+      if (cnt > 0)
       {
-        thread_group->io_event_count++;
-        connection= (TP_connection_unix *)native_event_get_userdata(&nev);
+        for (int i=0; i < cnt; i++)
+          queue_push_back(thread_group, (TP_connection_unix *)native_event_get_userdata(&ev[i]));
+
+        connection= queue_get(thread_group);
         break;
       }
     }
+
 
     /* And now, finally sleep */ 
     current_thread->woken = false; /* wake() sets this to true */
@@ -1276,9 +1314,9 @@ void wait_begin(thread_group_t *thread_group)
   
   DBUG_ASSERT(thread_group->active_thread_count >=0);
   DBUG_ASSERT(thread_group->connection_count > 0);
- 
+
   if ((thread_group->active_thread_count == 0) && 
-     (thread_group->queue.is_empty() || !thread_group->listener))
+     (is_queue_empty(thread_group) || !thread_group->listener))
   {
     /* 
       Group might stall while this thread waits, thus wake 
@@ -1341,8 +1379,9 @@ void TP_connection_unix::wait_begin(int type)
   DBUG_ENTER("wait_begin");
 
   DBUG_ASSERT(!waiting);
-  waiting= true;
-  ::wait_begin(thread_group);
+  waiting++;
+  if (waiting == 1)
+    ::wait_begin(thread_group);
   DBUG_VOID_RETURN;
 }
 
@@ -1355,8 +1394,9 @@ void TP_connection_unix::wait_end()
 { 
   DBUG_ENTER("wait_end");
   DBUG_ASSERT(waiting);
-  waiting= false;
-  ::wait_end(thread_group);
+  waiting--;
+  if (waiting == 0)
+    ::wait_end(thread_group);
   DBUG_VOID_RETURN;
 }
 
